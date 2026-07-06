@@ -14,13 +14,17 @@
 
 import asyncio
 import logging
+import math
+import random
 from collections import deque
 from typing import Any
 
 import ray
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
+
+_REPLAY_PRIORITY_EPS = 1e-6
 
 
 @ray.remote(num_cpus=2, max_concurrency=20)
@@ -31,10 +35,21 @@ class MessageQueue:
 
     def __init__(self, config: DictConfig, max_queue_size: int = 1000):
         self.config = config
-        if max_queue_size is None:
-            raise ValueError(f"max_queue_size cannot be None, got: {max_queue_size}")
-        self.max_queue_size = int(max_queue_size)
+        replay_config = OmegaConf.select(config, "async_training.replay", default={}) or {}
+        self.replay_enabled = bool(replay_config.get("enable", False))
+        if self.replay_enabled:
+            self.max_queue_size = int(replay_config.get("buffer_size", 0))
+            if self.max_queue_size <= 0:
+                raise ValueError(f"async_training.replay.buffer_size must be > 0, got: {self.max_queue_size}")
+        else:
+            if max_queue_size is None:
+                raise ValueError(f"max_queue_size cannot be None, got: {max_queue_size}")
+            self.max_queue_size = int(max_queue_size)
         self.queue = deque(maxlen=self.max_queue_size)
+        self.producer_done = False
+        self._rng = random.Random(int(replay_config.get("seed", 0))) if self.replay_enabled else None
+        self.replay_alpha = float(replay_config.get("alpha", 0.0)) if self.replay_enabled else 0.0
+        self.replay_beta = float(replay_config.get("beta", 0.0)) if self.replay_enabled else 0.0
 
         self.val_queue = deque()
 
@@ -50,7 +65,7 @@ class MessageQueue:
         self.total_consumed = 0
         self.dropped_samples = 0
 
-        print(f"[MessageQueue] initialized with max_queue_size={max_queue_size}")
+        print(f"[MessageQueue] initialized with max_queue_size={self.max_queue_size}")
 
     async def put_sample(self, sample: Any) -> bool:
         """
@@ -63,6 +78,11 @@ class MessageQueue:
             bool: Whether the sample was successfully put into the queue
         """
         async with self._lock:
+            if self.replay_enabled and sample is None:
+                self.producer_done = True
+                self._consumer_condition.notify_all()
+                return True
+
             # If queue is full, remove the oldest sample (rarely happens)
             is_drop = False
             if len(self.queue) >= self.max_queue_size:
@@ -78,9 +98,116 @@ class MessageQueue:
 
             if self.total_produced % 100 == 0:
                 print(f"MessageQueue stats: produced={self.total_produced}, queue_size={len(self.queue)}")
+            if self.replay_enabled:
+                return True
             if is_drop:
                 return False
             return True
+
+    async def get_samples(self, batch_size: int) -> tuple[list[Any], int] | None:
+        """
+        Get replay samples without removing them from the queue.
+
+        Returns:
+            tuple: (samples, queue_length), or None when producer finished before
+            a full replay batch became available.
+        """
+        if not self.replay_enabled:
+            raise RuntimeError("get_samples is only available when async_training.replay.enable=True")
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got: {batch_size}")
+
+        async with self._lock:
+            while len(self.queue) < batch_size and not self.producer_done and self.running:
+                await self._consumer_condition.wait()
+
+            if len(self.queue) < batch_size:
+                return None
+
+            queue_snapshot = list(self.queue)
+            queue_len = len(queue_snapshot)
+            if self.replay_alpha <= 0:
+                indices = self._rng.sample(range(queue_len), batch_size)
+                samples = [queue_snapshot[idx] for idx in indices]
+            else:
+                probabilities = self._priority_probabilities(queue_snapshot)
+                indices = self._weighted_sample_without_replacement(probabilities, batch_size)
+                samples = [queue_snapshot[idx] for idx in indices]
+
+                if self.replay_beta > 0:
+                    is_weights = [(1.0 / (queue_len * probabilities[idx])) ** self.replay_beta for idx in indices]
+                    max_weight = max(is_weights)
+                    if max_weight > 0 and math.isfinite(max_weight):
+                        is_weights = [weight / max_weight for weight in is_weights]
+                    else:
+                        is_weights = [1.0] * len(samples)
+                else:
+                    is_weights = [1.0] * len(samples)
+                samples = [
+                    self._attach_replay_is_weight(sample, is_weight)
+                    for sample, is_weight in zip(samples, is_weights, strict=True)
+                ]
+            self.total_consumed += len(samples)
+            return samples, queue_len
+
+    def _load_replay_sample(self, sample: Any) -> Any:
+        if isinstance(sample, (bytes, bytearray)):
+            return ray.cloudpickle.loads(sample)
+        return sample
+
+    def _dump_replay_sample(self, original_sample: Any, loaded_sample: Any) -> Any:
+        if isinstance(original_sample, (bytes, bytearray)):
+            return ray.cloudpickle.dumps(loaded_sample)
+        return loaded_sample
+
+    def _get_replay_priority(self, sample: Any) -> float:
+        try:
+            loaded_sample = self._load_replay_sample(sample)
+            priority = float(getattr(loaded_sample, "replay_priority", 1.0))
+        except Exception:
+            priority = 1.0
+        if not math.isfinite(priority) or priority <= 0:
+            return _REPLAY_PRIORITY_EPS
+        return priority
+
+    def _attach_replay_is_weight(self, sample: Any, weight: float) -> Any:
+        try:
+            loaded_sample = self._load_replay_sample(sample)
+            setattr(loaded_sample, "replay_is_weight", float(weight))
+            return self._dump_replay_sample(sample, loaded_sample)
+        except Exception:
+            return sample
+
+    def _priority_probabilities(self, queue_snapshot: list[Any]) -> list[float]:
+        weighted_priorities = [self._get_replay_priority(sample) ** self.replay_alpha for sample in queue_snapshot]
+        total = sum(weighted_priorities)
+        if total <= 0 or not math.isfinite(total):
+            return [1.0 / len(queue_snapshot)] * len(queue_snapshot)
+        return [priority / total for priority in weighted_priorities]
+
+    def _weighted_sample_without_replacement(self, probabilities: list[float], batch_size: int) -> list[int]:
+        available_indices = list(range(len(probabilities)))
+        available_weights = list(probabilities)
+        selected_indices = []
+
+        for _ in range(batch_size):
+            total_weight = sum(available_weights)
+            if total_weight <= 0 or not math.isfinite(total_weight):
+                selected_position = self._rng.randrange(len(available_indices))
+            else:
+                threshold = self._rng.random() * total_weight
+                cumulative = 0.0
+                selected_position = len(available_weights) - 1
+                for position, weight in enumerate(available_weights):
+                    cumulative += weight
+                    if cumulative >= threshold:
+                        selected_position = position
+                        break
+
+            selected_indices.append(available_indices.pop(selected_position))
+            available_weights.pop(selected_position)
+
+        return selected_indices
 
     async def get_sample(self) -> Any | None:
         """
@@ -198,6 +325,11 @@ class MessageQueueClient:
     async def get_sample(self) -> Any | None:
         """Get single sample from queue, wait until one is available (async)"""
         future = self.queue_actor.get_sample.remote()
+        return await asyncio.wrap_future(future.future())
+
+    async def get_samples(self, batch_size: int) -> Any | None:
+        """Get replay samples from queue without removing them (async)"""
+        future = self.queue_actor.get_samples.remote(batch_size)
         return await asyncio.wrap_future(future.future())
 
     async def get_queue_size(self) -> int:

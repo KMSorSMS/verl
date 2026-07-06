@@ -145,6 +145,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.trigger_parameter_sync_step = config.async_training.trigger_parameter_sync_step
         self.last_ckpt_version = 0
         self.train_role = Role.ActorRollout if config.async_training.use_trainer_do_validate else Role.Actor
+        replay_config = OmegaConf.select(config, "async_training.replay", default={}) or {}
+        self.replay_enabled = bool(replay_config.get("enable", False))
+        self.replay_train_steps = replay_config.get("train_steps", None)
 
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.require_batches = config.async_training.require_batches
@@ -285,41 +288,57 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             flush=True,
         )
 
-        # Collect samples using a simple loop calling get_sample
         consumer_start = time.time()
-        queue_samples = []
-        queue_len = 0
-        while len(queue_samples) < self.required_samples:
-            # Get a single sample and wait until there is a sample or None is received
-            sample, queue_len = await self.message_queue_client.get_sample()
+        if self.replay_enabled:
+            result = await self.message_queue_client.get_samples(self.required_samples)
+            consumer_end = time.time()
+            if result is None:
+                print("[FullyAsyncTrainer] replay queue did not provide a full batch")
+                return None, None
+            queue_samples, queue_len = result
+        else:
+            # Collect samples using a simple loop calling get_sample
+            queue_samples = []
+            queue_len = 0
+            while len(queue_samples) < self.required_samples:
+                # Get a single sample and wait until there is a sample or None is received
+                sample, queue_len = await self.message_queue_client.get_sample()
 
-            if sample is None:
-                print(
-                    f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
-                    f"Collected {len(queue_samples)}/{self.required_samples} samples"
-                )
-                break
+                if sample is None:
+                    print(
+                        f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
+                        f"Collected {len(queue_samples)}/{self.required_samples} samples"
+                    )
+                    break
 
-            queue_samples.append(sample)
+                queue_samples.append(sample)
 
-            if len(queue_samples) % 64 == 0:
-                print(
-                    f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples. "
-                    f"mq_len: {queue_len}"
-                )
+                if len(queue_samples) % 64 == 0:
+                    print(
+                        f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples. "
+                        f"mq_len: {queue_len}"
+                    )
+            consumer_end = time.time()
 
-        consumer_end = time.time()
+            if not queue_samples or len(queue_samples) < self.required_samples:
+                print("[FullyAsyncTrainer] not enough samples collected after loop")
+                return None, None
 
-        if not queue_samples or len(queue_samples) < self.required_samples:
-            print("[FullyAsyncTrainer] not enough samples collected after loop")
-            return None, None
         total_wait_time = consumer_end - consumer_start
 
-        print(
-            f"[FullyAsyncTrainer] Loop collection completed: {len(queue_samples)}/{self.required_samples} samples, "
-            f"total wait time: {total_wait_time:.2f} seconds. "
-            f"mq_len: {queue_len}"
-        )
+        if self.replay_enabled:
+            print(
+                f"[FullyAsyncTrainer] Replay collection completed: "
+                f"{len(queue_samples)}/{self.required_samples} samples, "
+                f"total wait time: {total_wait_time:.2f} seconds. "
+                f"mq_len: {queue_len}"
+            )
+        else:
+            print(
+                f"[FullyAsyncTrainer] Loop collection completed: {len(queue_samples)}/{self.required_samples} samples, "
+                f"total wait time: {total_wait_time:.2f} seconds. "
+                f"mq_len: {queue_len}"
+            )
 
         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
         # Assemble batch - now working directly with RolloutSample objects
@@ -423,6 +442,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         Args:
             batch_dict: Raw data dictionary
         """
+        if (
+            self.replay_enabled
+            and self.replay_train_steps is not None
+            and self.global_steps > int(self.replay_train_steps)
+        ):
+            raise TrainingStopException(
+                f"Training terminated: replay train_steps={self.replay_train_steps} reached"
+            )
+
         self.metrics = {"training/global_step": self.global_steps, "training/epoch": self.epoch}
         self.timing_raw = {}
         # reward message
@@ -441,6 +469,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             batch = self._fit_compute_ref_log_prob(batch)
             batch = self._fit_compute_critic(batch)
             batch = self._fit_compute_advantage(batch)
+            batch = self._fit_apply_replay_is_weights(batch)
             batch = self._fit_update_critic(batch)
             batch = self._fit_update_actor(batch)
             self._fit_update_local_step()
@@ -464,6 +493,36 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 raise TrainingStopException("Training terminated: queue returned None")
             self._collect_metrics_from_samples(batch, metrics)
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+        return batch
+
+    def _fit_apply_replay_is_weights(self, batch: DataProto) -> DataProto:
+        if "replay_is_weights" not in batch.batch.keys():
+            return batch
+
+        replay_is_weights = batch.batch.pop("replay_is_weights")
+        if not self.replay_enabled or "advantages" not in batch.batch.keys():
+            return batch
+
+        advantages = batch.batch["advantages"]
+        if replay_is_weights.shape[0] != advantages.shape[0]:
+            raise ValueError(
+                f"replay_is_weights length {replay_is_weights.shape[0]} does not match "
+                f"advantages batch size {advantages.shape[0]}"
+            )
+
+        if not replay_is_weights.ne(1.0).any().item():
+            return batch
+
+        weights = replay_is_weights.to(device=advantages.device, dtype=advantages.dtype)
+        view_shape = [weights.shape[0]] + [1] * (advantages.dim() - 1)
+        batch.batch["advantages"] = advantages * weights.view(*view_shape)
+        self.metrics.update(
+            {
+                "async_replay/is_weight_mean": weights.float().mean().item(),
+                "async_replay/is_weight_min": weights.float().min().item(),
+                "async_replay/is_weight_max": weights.float().max().item(),
+            }
+        )
         return batch
 
     def _compute_old_log_prob(self, batch: DataProto):
@@ -512,6 +571,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             await asyncio.wrap_future(self.rollouter._stop_profiling.remote().future())
 
         with marked_timer("timing_s/param_sync", self.timing_raw):
+            if self.replay_enabled:
+                await asyncio.wrap_future(self.rollouter.pause_for_parameter_sync.remote().future())
             await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
         print(
             f"[FullyAsyncTrainer] _fit_update_weights, "

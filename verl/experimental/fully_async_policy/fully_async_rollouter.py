@@ -21,7 +21,7 @@ from pprint import pformat
 import numpy as np
 import ray
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 from verl.experimental.fully_async_policy.detach_utils import (
@@ -48,6 +48,27 @@ from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_REPLAY_PRIORITY_EPS = 1e-6
+
+
+def _compute_replay_priority(batch: DataProto) -> float:
+    if "rm_scores" not in batch.batch.keys():
+        return _REPLAY_PRIORITY_EPS
+
+    rm_scores = batch.batch["rm_scores"].detach().float()
+    if rm_scores.dim() > 1:
+        rewards = rm_scores.sum(dim=tuple(range(1, rm_scores.dim())))
+    else:
+        rewards = rm_scores
+
+    if rewards.numel() <= 1:
+        return _REPLAY_PRIORITY_EPS
+
+    priority = rewards.std(unbiased=False).item() + _REPLAY_PRIORITY_EPS
+    if not np.isfinite(priority) or priority <= 0:
+        return _REPLAY_PRIORITY_EPS
+    return float(priority)
 
 
 class FullyAsyncLLMServerManager(LLMServerManager):
@@ -383,6 +404,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # Config
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
+        replay_config = OmegaConf.select(config, "async_training.replay", default={}) or {}
+        self.replay_enabled = bool(replay_config.get("enable", False))
+        self.replay_buffer_size = int(replay_config.get("buffer_size", 0))
+        self.replay_train_steps = replay_config.get("train_steps", None)
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.require_batches = config.async_training.require_batches
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
@@ -402,8 +427,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.step_start_time = time.time()
 
         # Concurrency control
-        # Modified by self.pause() or self._should_pause_generation()
+        # Modified by reset_staleness(), pause_for_parameter_sync(), or _should_pause_generation()
         self.paused = False
+        self.parameter_sync_in_progress = False
         self.running = True
 
         # Add dataloader lock
@@ -437,10 +463,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 self.total_rollout_steps
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
+            if self.replay_enabled and self.replay_train_steps is not None:
+                self.total_train_steps = int(self.replay_train_steps)
 
             self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * 16
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
-            self.max_queue_size = self.max_required_samples
+            self.max_queue_size = self.replay_buffer_size if self.replay_enabled else self.max_required_samples
 
             print(
                 f"[FullyAsyncRollouter] required_samples : {self.required_samples} "
@@ -467,6 +495,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         Returns timing_raw dictionary for metrics.
         """
         async with self.lock:
+            self.parameter_sync_in_progress = False
             self.paused = False
             # Wake the drain loop in _processor_worker so it can exit early and resume submitting
             # new samples to idle replicas instead of waiting for long-tail in-flight tasks.
@@ -493,6 +522,29 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.step_start_time = time.time()
 
         return timing_raw
+
+    async def pause_for_parameter_sync(self):
+        """Pause rollout submission and wait until active generation tasks drain."""
+        async with self.lock:
+            self.parameter_sync_in_progress = True
+            self.paused = True
+            self._resume_event.clear()
+
+        while True:
+            async with self.lock:
+                active_tasks = set(self.active_tasks)
+
+            if not active_tasks:
+                self.idle_start_time = time.time()
+                print("[FullyAsyncRollouter][Public][pause_for_parameter_sync] active generation drained")
+                return
+
+            done_tasks, _ = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done_tasks:
+                await task
+
+            async with self.lock:
+                self.active_tasks.difference_update(done_tasks)
 
     async def _start_profiling(self):
         """Start rollout profiling on all replicas via LLMServerManager after weight sync."""
@@ -822,14 +874,18 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                             await task
 
             # Submit single sample processing
-            if self.paused:
-                await self._resume_event.wait()
-            async with self.lock:
-                task = safe_create_task(
-                    self._process_single_sample_streaming(rollout_sample),
-                    name=rollout_sample.sample_id,
-                    task_set=self.active_tasks,
-                )
+            while True:
+                if self.paused:
+                    await self._resume_event.wait()
+                async with self.lock:
+                    if self.paused:
+                        continue
+                    task = safe_create_task(
+                        self._process_single_sample_streaming(rollout_sample),
+                        name=rollout_sample.sample_id,
+                        task_set=self.active_tasks,
+                    )
+                    break
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
@@ -844,6 +900,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
+        rollout_sample.replay_priority = _compute_replay_priority(rollout_sample.full_batch)
         rollout_sample.rollout_status = await self.get_statistics()
 
         success = await self.message_queue_client.put_sample(
@@ -985,7 +1042,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         queue_stats = await self.message_queue_client.get_statistics()
         queue_size = queue_stats["queue_size"]
 
-        if queue_size >= self.max_queue_size:
+        if self.parameter_sync_in_progress:
+            if not self.paused:
+                print("[FullyAsyncRollouter][ShouldPause] due to parameter sync")
+            return True
+
+        if not self.replay_enabled and queue_size >= self.max_queue_size:
             if not self.paused:
                 print(
                     f"[FullyAsyncRollouter][ShouldPause]  "
@@ -993,7 +1055,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 )
             return True
 
-        if self.staleness_samples >= self.max_required_samples:
+        if not self.replay_enabled and self.staleness_samples >= self.max_required_samples:
             if not self.paused:
                 print(
                     "[FullyAsyncRollouter][ShouldPause] "

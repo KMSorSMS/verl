@@ -25,6 +25,14 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
+  replay:
+    enable: False
+    buffer_size: 0
+    seed: 0
+    train_steps: null
+    alpha: 0.0
+    beta: 0.0
+
 # Rollout config
 rollout:
 

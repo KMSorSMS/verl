@@ -38,6 +38,10 @@ class RolloutSample:
     # Processing metadata
     rollout_status: dict[str, Any]
 
+    # Replay metadata
+    replay_priority: float = 1.0
+    replay_is_weight: float = 1.0
+
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
     """
@@ -114,6 +118,8 @@ def assemble_batch_from_rollout_samples(
 
     for rs in rollout_samples:
         batch = addition_process(rs.full_batch)
+        replay_is_weight = float(getattr(rs, "replay_is_weight", 1.0))
+        batch.batch["replay_is_weights"] = torch.full((len(batch),), replay_is_weight, dtype=torch.float32)
         rollout_samples_batch.append(batch)
     final_batch = DataProto.concat(rollout_samples_batch)
 

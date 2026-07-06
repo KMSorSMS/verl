@@ -1037,8 +1037,22 @@ class AgentLoopWorker:
         input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
         position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
         optional_outputs = {}
-        if inputs[0].response_logprobs is not None:
-            optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+        response_logprobs = [input.response_logprobs for input in inputs]
+        if any(logprobs is not None for logprobs in response_logprobs):
+            # Empty/aborted partial generations have no trainable response tokens;
+            # keep rollout_log_probs batch-aligned with masked zeros for them.
+            padded_response_logprobs = []
+            for input, logprobs in zip(inputs, response_logprobs, strict=True):
+                if logprobs is not None:
+                    padded_response_logprobs.append(logprobs)
+                    continue
+                if input.response_mask.any().item():
+                    raise ValueError(
+                        "response_logprobs is None for a sample with non-empty response_mask; "
+                        "cannot build aligned rollout_log_probs"
+                    )
+                padded_response_logprobs.append(torch.zeros_like(input.response_mask, dtype=torch.float32))
+            optional_outputs["rollout_log_probs"] = torch.cat(padded_response_logprobs, dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
