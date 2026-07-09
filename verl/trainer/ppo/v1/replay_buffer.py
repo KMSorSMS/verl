@@ -139,6 +139,10 @@ class ReplayBuffer:
                         partition[key] = {}
                     partition[key].update(tag)
 
+    def should_add_batch_to_generate(self, global_steps: int, partition_id: str, batch_size: int) -> bool:
+        """Return whether the trainer should submit another batch for generation."""
+        return True
+
     def _has_enough_samples(self, global_steps: int, partition_id: str, batch_size: int) -> bool:
         # For wait strategy, we need to wait all trajectories that reach threshold to finish
         if self.max_off_policy_strategy == "wait":

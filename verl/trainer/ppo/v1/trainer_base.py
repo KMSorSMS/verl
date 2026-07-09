@@ -387,7 +387,14 @@ class PPOTrainer(ABC):
                 self._log_rollout_data(batch, self.timing_raw, rollout_data_dir)
 
             # 7. cleanup transfer queue
-            tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+            reuse_replay = self.config.trainer.v1.sampler.sampler_kwargs.get("reuse_replay", False)
+            clear_keys = (
+                [key for key, tag in zip(batch.keys, batch.tags, strict=False) if tag.get("is_padding", False)]
+                if reuse_replay
+                else batch.keys
+            )
+            if clear_keys:
+                tq.kv_clear(keys=clear_keys, partition_id=batch.partition_id)
 
             self.logger.log(data=metrics, step=self.global_steps)
             progress_bar.update(1)
@@ -405,7 +412,7 @@ class PPOTrainer(ABC):
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
         # 1. add batch to generate
-        self._add_batch_to_generate()
+        self._maybe_add_batch_to_generate()
 
         # 2. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
@@ -1113,6 +1120,17 @@ class PPOTrainer(ABC):
 
         # add batch to agent loop manager
         self.agent_loop_manager.generate_sequences(batch)
+
+    def _maybe_add_batch_to_generate(self) -> bool:
+        """Submit generation only when the replay buffer wants more samples."""
+        should_add = self.replay_buffer.should_add_batch_to_generate(
+            global_steps=self.global_steps,
+            partition_id="train",
+            batch_size=self.config.data.train_batch_size,
+        )
+        if should_add:
+            self._add_batch_to_generate()
+        return should_add
 
     def _compute_reward_colocate(self, batch: KVBatchMeta, metrics: dict | None = None) -> KVBatchMeta:
         """Compute the reward score with a colocated reward model."""

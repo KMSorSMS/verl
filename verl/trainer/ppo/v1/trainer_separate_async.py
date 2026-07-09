@@ -101,8 +101,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
     def on_train_begin(self):
         num_warmup_batches = self.config.trainer.v1.separate_async.num_warmup_batches
         for _ in range(num_warmup_batches):
-            self._add_batch_to_generate()
-        logger.info(f"Added {num_warmup_batches} warmup batches to the agent loop manager")
+            self._maybe_add_batch_to_generate()
+        logger.info(f"Submitted up to {num_warmup_batches} warmup batches to the agent loop manager")
 
     def on_validate_begin(self):
         if self.current_mode == HybridEngineMode.TRAINER:
