@@ -158,7 +158,7 @@ class ReplayBuffer:
         kept_keys, kept_tags = [], []
         dropped_keys, dropped_tags = [], []
         for key, tag in zip(batch.keys, batch.tags, strict=False):
-            prompt_global_steps = tag["global_steps"]
+            prompt_global_steps = self.prompt_global_steps[partition_id].get(key, global_steps)  # Fix E: mooncake 取回的 tag 丢了 global_steps,用 register 时的缓存
             if (global_steps - prompt_global_steps + 1) / self.parameter_sync_step > self.max_off_policy_threshold:
                 dropped_keys.append(key)
                 dropped_tags.append(tag)
@@ -172,7 +172,7 @@ class ReplayBuffer:
             # TODO: should we drop the entire GRPO group if any of its sessions exceeds the threshold?
             tq.kv_clear(partition_id=batch.partition_id, keys=dropped_keys)
             logger.warning(f"Dropped {len(dropped_keys)} max off policy samples from partition {batch.partition_id}")
-            dropped_global_steps = np.array([tag["global_steps"] for tag in dropped_tags])
+            dropped_global_steps = np.array([self.prompt_global_steps[partition_id].get(k, global_steps) for k in dropped_keys])  # Fix E
             trajectory_staleness = (global_steps - dropped_global_steps + 1) / self.parameter_sync_step
             prefix = "training" if partition_id == "train" else "validation"
             metrics[f"{prefix}/off_policy/dropped_samples"] = len(dropped_keys)

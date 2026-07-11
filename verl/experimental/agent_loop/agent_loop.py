@@ -133,7 +133,8 @@ class AgentLoopOutput(BaseModel):
         reward_score = output.pop("reward_score", None)
         if reward_score is not None:
             rm_scores = torch.zeros_like(output["response_mask"], dtype=torch.float32)
-            rm_scores[-1] = reward_score
+            if rm_scores.numel() > 0:  # Fix B: empty response -> size-0 rm_scores, skip token-reward assign
+                rm_scores[-1] = reward_score
             output["rm_scores"] = rm_scores
 
         teacher_ids, teacher_logprobs = (
@@ -1187,6 +1188,7 @@ class AgentLoopManager:
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id, soft=True
                     ),
+                    runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1", "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}},  # Fix F: AgentLoopWorker 需 CUDA context 给 mooncake 注册 GPU 显存
                 ).remote(
                     self.config,
                     self.llm_client,

@@ -85,7 +85,8 @@ def run_ppo(config, task_runner_class) -> None:
         )
         runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
     else:
-        runner = task_runner_class.remote()
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy as _NASS  # Fix C
+        runner = task_runner_class.options(scheduling_strategy=_NASS(node_id=ray.get_runtime_context().get_node_id(), soft=False)).remote()  # Fix C: pin TaskRunner to head node so mooncake_master lands on head
     ray.get(runner.run.remote(config))
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
