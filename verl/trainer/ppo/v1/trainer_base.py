@@ -1429,6 +1429,64 @@ class PPOTrainer(ABC):
 
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
+        distill_kl_coef = float(self.config.algorithm.distill_kl_coef)
+        if distill_kl_coef < 0:
+            raise ValueError(f"algorithm.distill_kl_coef must be non-negative, got {distill_kl_coef}")
+        if distill_kl_coef > 0:
+            distill_topk = int(self.config.actor_rollout_ref.rollout.distill_topk)
+            if distill_topk <= 0:
+                raise ValueError("algorithm.distill_kl_coef requires actor_rollout_ref.rollout.distill_topk > 0")
+            if self.use_teacher_policy:
+                raise NotImplementedError("behavior-policy top-k KL cannot be combined with teacher-model distillation")
+            actor_strategy = self.config.actor_rollout_ref.actor.strategy
+            if actor_strategy not in ("fsdp", "fsdp2", "veomni", "megatron"):
+                raise NotImplementedError(
+                    f"behavior-policy top-k KL is not supported for actor strategy {actor_strategy!r}"
+                )
+            if self.config.actor_rollout_ref.model.get("use_fused_kernels", False):
+                raise NotImplementedError("behavior-policy top-k KL requires actor logits; fused kernels hide them")
+
+            if batch.fields is None:
+                actor_fields = [
+                    "prompts",
+                    "responses",
+                    "input_ids",
+                    "position_ids",
+                    "response_mask",
+                    "loss_mask",
+                    "old_log_probs",
+                    "advantages",
+                    "multi_modal_inputs",
+                    "teacher_topk_logprobs",
+                    "teacher_topk_ids",
+                ]
+                if self.config.actor_rollout_ref.actor.use_kl_loss:
+                    actor_fields.append("ref_log_prob")
+                rollout_correction = self.config.algorithm.get("rollout_correction")
+                if (
+                    rollout_correction
+                    and not rollout_correction.get("bypass_mode", False)
+                    and rollout_correction.get("rollout_is") is not None
+                ):
+                    actor_fields.append("rollout_is_weights")
+                if self.config.actor_rollout_ref.rollout.enable_rollout_routing_replay:
+                    actor_fields.append("routed_experts")
+            else:
+                actor_fields = [batch.fields] if isinstance(batch.fields, str) else list(batch.fields)
+                for field in ("teacher_topk_logprobs", "teacher_topk_ids"):
+                    if field not in actor_fields:
+                        actor_fields.append(field)
+
+            extra_info = dict(batch.extra_info or {})
+            extra_info["distill_kl_coef"] = distill_kl_coef
+            batch = KVBatchMeta(
+                keys=batch.keys,
+                tags=batch.tags,
+                partition_id=batch.partition_id,
+                fields=actor_fields,
+                extra_info=extra_info,
+            )
+
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
