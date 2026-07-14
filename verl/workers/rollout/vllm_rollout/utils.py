@@ -136,6 +136,25 @@ def monkey_patch_compute_logits(model, vocab_size: int):
     model.compute_logits = MethodType(compute_logits, model)
 
 
+def disable_vllm_logprob_token_decoding() -> None:
+    """Keep vLLM from decoding the per-position logprob alternatives.
+
+    The response detokenizer remains enabled; verl only discards the unused
+    ``Logprob.decoded_token`` strings attached to logprob entries.
+    """
+    from vllm.v1.engine import logprobs as vllm_logprobs
+
+    current_converter = vllm_logprobs.convert_ids_list_to_tokens
+    if getattr(current_converter, "_verl_disabled", False):
+        return
+
+    def no_decode(_tokenizer, token_ids):
+        return [None] * len(token_ids)
+
+    no_decode._verl_disabled = True
+    vllm_logprobs.convert_ids_list_to_tokens = no_decode
+
+
 class vLLMColocateWorkerExtension:
     """
     The class for vLLM's worker to inherit from, in the colocate setting.
@@ -481,7 +500,9 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
     result_dict["prompt_logprobs"] = prompt_logprobs_ls
 
 
-def extract_response_topk_logprobs(output: RequestOutput, topk: int, result_dict: dict[str, list]) -> None:
+def extract_response_topk_logprobs(
+    output: RequestOutput, topk: int, result_dict: dict[str, list], vocab_size: Optional[int] = None
+) -> None:
     """Extract exactly ``topk`` behavior-policy entries for every generated token."""
     if topk <= 0:
         return
@@ -496,22 +517,36 @@ def extract_response_topk_logprobs(output: RequestOutput, topk: int, result_dict
 
     pad_logprob = torch.finfo(torch.float16).min
     response_ids, response_logprobs = [], []
+    invalid_ids = []
     for logprobs_dict in completion.logprobs:
         ids = [0] * topk
         logprobs = [pad_logprob] * topk
         missing_rank = False
         for token_id, token_logprob in logprobs_dict.items():
+            token_id = int(token_id)
+            if token_id < 0 or (vocab_size is not None and token_id >= vocab_size):
+                if len(invalid_ids) < 8:
+                    invalid_ids.append(token_id)
+                continue
             rank = token_logprob.rank
             if rank is None:
                 missing_rank = True
                 break
             if 1 <= rank <= topk:
-                ids[rank - 1] = int(token_id)
+                ids[rank - 1] = token_id
                 value = float(token_logprob.logprob)
                 logprobs[rank - 1] = max(value, pad_logprob) if math.isfinite(value) else pad_logprob
 
         if missing_rank:
-            ranked = sorted(logprobs_dict.items(), key=lambda item: item[1].logprob, reverse=True)[:topk]
+            ranked = sorted(
+                (
+                    (int(token_id), token_logprob)
+                    for token_id, token_logprob in logprobs_dict.items()
+                    if int(token_id) >= 0 and (vocab_size is None or int(token_id) < vocab_size)
+                ),
+                key=lambda item: item[1].logprob,
+                reverse=True,
+            )[:topk]
             ids[: len(ranked)] = [int(token_id) for token_id, _ in ranked]
             logprobs[: len(ranked)] = [
                 max(float(token_logprob.logprob), pad_logprob)
@@ -522,6 +557,13 @@ def extract_response_topk_logprobs(output: RequestOutput, topk: int, result_dict
 
         response_ids.append(ids)
         response_logprobs.append(logprobs)
+
+    if invalid_ids:
+        logger.warning(
+            "vLLM returned logprob token ids outside the tokenizer vocabulary; "
+            "verl padded these entries instead of decoding them: %s",
+            invalid_ids,
+        )
 
     result_dict["teacher_topk_ids"] = response_ids
     result_dict["teacher_topk_logprobs"] = response_logprobs

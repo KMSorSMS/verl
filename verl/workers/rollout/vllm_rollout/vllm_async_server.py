@@ -51,6 +51,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     SuppressSignalInThread,
     build_cli_args_from_config,
     build_mtp_speculative_config,
+    disable_vllm_logprob_token_decoding,
     extract_prompt_logprobs,
     extract_response_topk_logprobs,
     get_vllm_max_lora_rank,
@@ -517,6 +518,7 @@ class vLLMHttpServer:
         )
         distill_topk = sampling_params.pop("distill_topk", 0)
         if distill_topk > 0:
+            disable_vllm_logprob_token_decoding()
             sampling_params["logprobs"] = distill_topk
         else:
             sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
@@ -585,7 +587,15 @@ class vLLMHttpServer:
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
         )
-        extract_response_topk_logprobs(output=final_res, topk=distill_topk, result_dict=extra_fields)
+        if distill_topk > 0:
+            extract_response_topk_logprobs(
+                output=final_res,
+                topk=distill_topk,
+                result_dict=extra_fields,
+                vocab_size=len(self.model_config.tokenizer),
+            )
+        else:
+            extract_response_topk_logprobs(output=final_res, topk=distill_topk, result_dict=extra_fields)
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:

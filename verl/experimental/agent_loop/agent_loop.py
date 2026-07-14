@@ -181,7 +181,13 @@ class AgentLoopOutput(BaseModel):
             teacher_topk_ids = torch.tensor(teacher_topk_ids, dtype=torch.int32)
             teacher_topk_logprobs = torch.tensor(teacher_topk_logprobs, dtype=torch.float16)
             expected_response_len = output["responses"].size(0)
-            if (
+            if expected_response_len == 0:
+                # empty response (model generated no tokens): nothing to distill;
+                # reshape to a valid [0, K] so downstream batching stays consistent.
+                k = teacher_topk_ids.shape[-1] if teacher_topk_ids.ndim == 2 else 1
+                teacher_topk_ids = teacher_topk_ids.reshape(0, k)
+                teacher_topk_logprobs = teacher_topk_logprobs.reshape(0, k)
+            if expected_response_len > 0 and (
                 teacher_topk_ids.ndim != 2
                 or teacher_topk_ids.shape != teacher_topk_logprobs.shape
                 or teacher_topk_ids.size(0) != expected_response_len
