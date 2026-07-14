@@ -289,6 +289,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         elif "max_new_tokens" in sampling_params:
             limit_key = "max_new_tokens"
         original_max_tokens = sampling_params.get(limit_key) if limit_key else None
+        distill_topk = int(sampling_params.get("distill_topk", 0))
 
         final_output = TokenOutput(
             token_ids=[],
@@ -314,6 +315,24 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             final_output.token_ids.extend(output.token_ids)
             if output.log_probs is not None:
                 final_output.log_probs.extend(output.log_probs)
+            if distill_topk > 0:
+                teacher_topk_ids = output.extra_fields.get("teacher_topk_ids")
+                teacher_topk_logprobs = output.extra_fields.get("teacher_topk_logprobs")
+                if (teacher_topk_ids is None) != (teacher_topk_logprobs is None):
+                    raise ValueError("teacher_topk_ids and teacher_topk_logprobs must be provided together")
+                if output.token_ids and teacher_topk_ids is None:
+                    raise ValueError("vLLM omitted behavior-policy top-k metadata during async generation")
+                if teacher_topk_ids is not None:
+                    if len(teacher_topk_ids) != len(output.token_ids) or len(teacher_topk_logprobs) != len(
+                        output.token_ids
+                    ):
+                        raise ValueError(
+                            "behavior-policy top-k metadata must have one row per generated token, got "
+                            f"ids={len(teacher_topk_ids)}, logprobs={len(teacher_topk_logprobs)}, "
+                            f"tokens={len(output.token_ids)}"
+                        )
+                    final_output.extra_fields.setdefault("teacher_topk_ids", []).extend(teacher_topk_ids)
+                    final_output.extra_fields.setdefault("teacher_topk_logprobs", []).extend(teacher_topk_logprobs)
             # On partial rollout resume the model version may differ, so keep
             # existing routing and only append routing for newly generated tokens.
             if output.routed_experts is not None and len(output.token_ids) > 0:
