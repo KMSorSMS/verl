@@ -149,7 +149,10 @@ def disable_vllm_logprob_token_decoding() -> None:
         return
 
     def no_decode(_tokenizer, token_ids):
-        return [None] * len(token_ids)
+        # empty strings (not None): skips the overflow-prone tokenizer.decode of
+        # high-rank top-k alternatives, while staying compatible with vLLM's
+        # downstream _verify_tokens which calls str methods (.endswith) on these.
+        return [""] * len(token_ids)
 
     no_decode._verl_disabled = True
     vllm_logprobs.convert_ids_list_to_tokens = no_decode
