@@ -52,6 +52,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     build_cli_args_from_config,
     build_mtp_speculative_config,
     extract_prompt_logprobs,
+    extract_response_topk_logprobs,
     get_vllm_max_lora_rank,
 )
 
@@ -514,7 +515,11 @@ class vLLMHttpServer:
         assert 1 <= max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        distill_topk = sampling_params.pop("distill_topk", 0)
+        if distill_topk > 0:
+            sampling_params["logprobs"] = distill_topk
+        else:
+            sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
@@ -580,6 +585,7 @@ class vLLMHttpServer:
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
         )
+        extract_response_topk_logprobs(output=final_res, topk=distill_topk, result_dict=extra_fields)
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:

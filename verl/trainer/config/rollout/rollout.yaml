@@ -232,6 +232,10 @@ multi_turn:
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: True
 
+# Number of behavior-policy top-k logprobs stored per response token for on-policy distillation.
+# Zero disables the wide TransferQueue artifact. Supported by vLLM only.
+distill_topk: 0
+
 # [Experimental] agent loop based rollout configs
 agent:
 

@@ -646,6 +646,7 @@ class AlgoConfig(BaseConfig):
 
             For backward compatibility, you can still pass a dict, which will be converted to
             RolloutCorrectionConfig automatically.
+        distill_kl_coef (float): Weight of the behavior-policy top-k forward-KL loss.
     """
 
     gamma: float = 1.0
@@ -661,6 +662,8 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+    # Weight of the behavior-policy top-k forward-KL loss. Zero disables the consumer.
+    distill_kl_coef: float = 0.0
     # GDPO (Group reward-Decoupled Normalization Policy Optimization) settings.
     # gdpo_reward_keys: keys in non_tensor_batch (from compute_score's return dict) that
     #   correspond to individual reward dimensions, e.g. ["format_reward", "accuracy_reward"].

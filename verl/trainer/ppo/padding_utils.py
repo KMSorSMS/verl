@@ -112,6 +112,12 @@ def construct_minimal_padding_template(
         rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
         rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
     )
+    if "teacher_topk_ids" in template_sample and "teacher_topk_logprobs" in template_sample:
+        topk = template_sample["teacher_topk_ids"].shape[-1]
+        template_sample["teacher_topk_ids"] = torch.zeros((1, topk), dtype=torch.int32)
+        template_sample["teacher_topk_logprobs"] = torch.full(
+            (1, topk), torch.finfo(torch.float16).min, dtype=torch.float16
+        )
     if "multi_modal_inputs" in template_sample:
         template_sample["multi_modal_inputs"] = {}
     if routed_experts is not None:

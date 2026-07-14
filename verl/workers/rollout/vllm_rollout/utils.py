@@ -14,6 +14,7 @@
 import ctypes
 import json
 import logging
+import math
 import os
 import platform
 import signal
@@ -478,3 +479,49 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
 
     result_dict["prompt_ids"] = prompt_ids_ls
     result_dict["prompt_logprobs"] = prompt_logprobs_ls
+
+
+def extract_response_topk_logprobs(output: RequestOutput, topk: int, result_dict: dict[str, list]) -> None:
+    """Extract exactly ``topk`` behavior-policy entries for every generated token."""
+    if topk <= 0:
+        return
+
+    completion = output.outputs[0]
+    if completion.logprobs is None or len(completion.logprobs) != len(completion.token_ids):
+        returned_logprobs = len(completion.logprobs) if completion.logprobs is not None else None
+        raise ValueError(
+            "vLLM response logprobs are missing or not aligned with generated token ids: "
+            f"got {returned_logprobs}, expected {len(completion.token_ids)}"
+        )
+
+    pad_logprob = torch.finfo(torch.float16).min
+    response_ids, response_logprobs = [], []
+    for logprobs_dict in completion.logprobs:
+        ids = [0] * topk
+        logprobs = [pad_logprob] * topk
+        missing_rank = False
+        for token_id, token_logprob in logprobs_dict.items():
+            rank = token_logprob.rank
+            if rank is None:
+                missing_rank = True
+                break
+            if 1 <= rank <= topk:
+                ids[rank - 1] = int(token_id)
+                value = float(token_logprob.logprob)
+                logprobs[rank - 1] = max(value, pad_logprob) if math.isfinite(value) else pad_logprob
+
+        if missing_rank:
+            ranked = sorted(logprobs_dict.items(), key=lambda item: item[1].logprob, reverse=True)[:topk]
+            ids[: len(ranked)] = [int(token_id) for token_id, _ in ranked]
+            logprobs[: len(ranked)] = [
+                max(float(token_logprob.logprob), pad_logprob)
+                if math.isfinite(float(token_logprob.logprob))
+                else pad_logprob
+                for _, token_logprob in ranked
+            ]
+
+        response_ids.append(ids)
+        response_logprobs.append(logprobs)
+
+    result_dict["teacher_topk_ids"] = response_ids
+    result_dict["teacher_topk_logprobs"] = response_logprobs

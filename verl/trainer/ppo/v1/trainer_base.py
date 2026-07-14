@@ -1439,6 +1439,7 @@ class PPOTrainer(ABC):
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
+        distillation_use_topk = distillation_use_topk or batch.extra_info.get("distill_kl_coef", 0.0) > 0
         extra_info = {
             "calculate_entropy": calculate_entropy,
             "distillation_use_topk": distillation_use_topk,

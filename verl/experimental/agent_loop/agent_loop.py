@@ -76,6 +76,52 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+_TEACHER_TOPK_PAD_LOGPROB = torch.finfo(torch.float16).min
+
+
+def align_response_topk_metadata(
+    merge_result,
+    response_topk_ids: Optional[list[list[int]]],
+    response_topk_logprobs: Optional[list[list[float]]],
+    *,
+    assistant_topk_ids: Optional[list[list[int]]] = None,
+    assistant_topk_logprobs: Optional[list[list[float]]] = None,
+) -> tuple[Optional[list[list[int]]], Optional[list[list[float]]]]:
+    """Apply Continuous Token boundary edits to response-token top-k metadata."""
+    if response_topk_ids is None and assistant_topk_ids is None:
+        return None, None
+    if (response_topk_ids is None) != (response_topk_logprobs is None):
+        raise ValueError("response top-k ids and logprobs must be provided together")
+    if (assistant_topk_ids is None) != (assistant_topk_logprobs is None):
+        raise ValueError("assistant top-k ids and logprobs must be provided together")
+
+    aligned_ids = list(response_topk_ids or [])
+    aligned_logprobs = list(response_topk_logprobs or [])
+    sample_rows = aligned_ids or assistant_topk_ids
+    topk = len(sample_rows[0])
+    pad_ids = [0] * topk
+    pad_logprobs = [_TEACHER_TOPK_PAD_LOGPROB] * topk
+
+    if merge_result.removed_prefix_token_count:
+        aligned_ids = aligned_ids[: -merge_result.removed_prefix_token_count]
+        aligned_logprobs = aligned_logprobs[: -merge_result.removed_prefix_token_count]
+
+    inserted_token_count = len(merge_result.inserted_token_ids)
+    aligned_ids += [pad_ids.copy() for _ in range(inserted_token_count)]
+    aligned_logprobs += [pad_logprobs.copy() for _ in range(inserted_token_count)]
+
+    if merge_result.kind == "assistant":
+        if assistant_topk_ids is None or len(assistant_topk_ids) != merge_result.appended_token_count:
+            raise ValueError("assistant top-k metadata must match the appended assistant token count")
+        aligned_ids += assistant_topk_ids
+        aligned_logprobs += assistant_topk_logprobs
+    elif merge_result.kind == "non_assistant":
+        aligned_ids += [pad_ids.copy() for _ in range(merge_result.appended_token_count)]
+        aligned_logprobs += [pad_logprobs.copy() for _ in range(merge_result.appended_token_count)]
+    else:
+        raise ValueError(f"Unknown Continuous Token merge kind: {merge_result.kind!r}")
+
+    return aligned_ids, aligned_logprobs
 
 
 class AgentLoopMetrics(BaseModel):
@@ -124,6 +170,29 @@ class AgentLoopOutput(BaseModel):
         response_logprobs = output.pop("response_logprobs", None)
         if response_logprobs is not None:
             output["rollout_log_probs"] = torch.tensor(response_logprobs, dtype=torch.float32)
+
+        teacher_topk_ids, teacher_topk_logprobs = (
+            output["extra_fields"].pop("teacher_topk_ids", None),
+            output["extra_fields"].pop("teacher_topk_logprobs", None),
+        )
+        if (teacher_topk_ids is None) != (teacher_topk_logprobs is None):
+            raise ValueError("teacher_topk_ids and teacher_topk_logprobs must be provided together")
+        if teacher_topk_ids is not None:
+            teacher_topk_ids = torch.tensor(teacher_topk_ids, dtype=torch.int32)
+            teacher_topk_logprobs = torch.tensor(teacher_topk_logprobs, dtype=torch.float16)
+            expected_response_len = output["responses"].size(0)
+            if (
+                teacher_topk_ids.ndim != 2
+                or teacher_topk_ids.shape != teacher_topk_logprobs.shape
+                or teacher_topk_ids.size(0) != expected_response_len
+            ):
+                raise ValueError(
+                    "behavior-policy top-k tensors must both have shape [response_len, K], got "
+                    f"ids={tuple(teacher_topk_ids.shape)}, logprobs={tuple(teacher_topk_logprobs.shape)}, "
+                    f"response_len={expected_response_len}"
+                )
+            output["teacher_topk_ids"] = teacher_topk_ids
+            output["teacher_topk_logprobs"] = teacher_topk_logprobs
 
         routed_experts = output.pop("routed_experts", None)
         if routed_experts is not None:
@@ -589,6 +658,8 @@ class AgentLoopWorker:
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
+        if config.distill_topk > 0:
+            sampling_params["distill_topk"] = config.distill_topk
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
             params["top_p"] = 1.0

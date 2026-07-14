@@ -14,6 +14,7 @@
 
 
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
@@ -141,6 +142,127 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
         metrics["kl_coef"] = config.kl_loss_coef
 
+    return policy_loss, metrics
+
+
+def _align_response_topk_to_sequence(data: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+    """Causally align response-token teacher distributions with full-sequence logits."""
+    teacher_ids = data["teacher_topk_ids"]
+    teacher_logprobs = data["teacher_topk_logprobs"]
+    if teacher_ids.is_nested != teacher_logprobs.is_nested:
+        raise ValueError("behavior-policy top-k ids and logprobs must use the same tensor layout")
+
+    def sequence_lengths(tensor: torch.Tensor) -> list[int]:
+        return tensor.offsets().diff().tolist() if tensor.is_nested else [tensor.shape[1]] * tensor.shape[0]
+
+    prompt_lens = sequence_lengths(data["prompts"])
+    response_lens = sequence_lengths(data["responses"])
+    sequence_lens = sequence_lengths(data["input_ids"])
+    aligned_ids, aligned_logprobs = [], []
+    for prompt_len, response_len, sequence_len, ids, logprobs in zip(
+        prompt_lens,
+        response_lens,
+        sequence_lens,
+        teacher_ids.unbind(),
+        teacher_logprobs.unbind(),
+        strict=True,
+    ):
+        if prompt_len < 1 or sequence_len != prompt_len + response_len:
+            raise ValueError(
+                f"invalid prompt/response lengths for top-k alignment: {prompt_len=}, {response_len=}, {sequence_len=}"
+            )
+        if ids.shape != logprobs.shape or ids.shape[0] != response_len:
+            raise ValueError(
+                "behavior-policy top-k tensors must have response_len rows, got "
+                f"ids={tuple(ids.shape)}, logprobs={tuple(logprobs.shape)}, {response_len=}"
+            )
+
+        topk = ids.shape[-1]
+        prefix_ids = torch.zeros((prompt_len - 1, topk), dtype=ids.dtype, device=ids.device)
+        suffix_ids = torch.zeros((1, topk), dtype=ids.dtype, device=ids.device)
+        pad_logprob = torch.finfo(logprobs.dtype).min
+        prefix_logprobs = torch.full(
+            (prompt_len - 1, topk), pad_logprob, dtype=logprobs.dtype, device=logprobs.device
+        )
+        suffix_logprobs = torch.full((1, topk), pad_logprob, dtype=logprobs.dtype, device=logprobs.device)
+        aligned_ids.append(torch.cat((prefix_ids, ids, suffix_ids), dim=0))
+        aligned_logprobs.append(torch.cat((prefix_logprobs, logprobs, suffix_logprobs), dim=0))
+
+    return (
+        torch.nested.as_nested_tensor(aligned_ids, layout=torch.jagged),
+        torch.nested.as_nested_tensor(aligned_logprobs, layout=torch.jagged),
+    )
+
+
+def _compute_behavior_topk_kl(config: ActorConfig, data: TensorDict, student_logits, data_format: str):
+    teacher_ids, teacher_logprobs = _align_response_topk_to_sequence(data)
+    if config.strategy in ("fsdp", "fsdp2", "veomni"):
+        from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, slice_input_tensor
+
+        teacher_ids = teacher_ids.values().unsqueeze(0)
+        teacher_logprobs = teacher_logprobs.values().unsqueeze(0)
+        if get_ulysses_sequence_parallel_world_size() > 1:
+            teacher_ids = slice_input_tensor(teacher_ids, dim=1)
+            teacher_logprobs = slice_input_tensor(teacher_logprobs, dim=1)
+        if teacher_ids.shape[:2] != student_logits.shape[:2]:
+            raise ValueError(
+                f"teacher/student sequence shapes do not match: {teacher_ids.shape[:2]} vs {student_logits.shape[:2]}"
+            )
+        student_logprobs = F.log_softmax(student_logits.float(), dim=-1)
+        student_topk_logprobs = torch.gather(student_logprobs, dim=-1, index=teacher_ids.long())
+        teacher_logprobs = teacher_logprobs.float()
+        kl = (teacher_logprobs.exp() * (teacher_logprobs - student_topk_logprobs)).sum(dim=-1)
+    elif config.strategy == "megatron":
+        from verl.models.mcore.util import preprocess_bshd_engine, preprocess_thd_engine
+        from verl.trainer.distillation.megatron.losses import _VocabParallelKLDivergence
+
+        preprocess = preprocess_thd_engine if data_format == "thd" else preprocess_bshd_engine
+        teacher_logprobs, *_ = preprocess(teacher_logprobs, pre_process=True)
+        teacher_ids, *_ = preprocess(teacher_ids, pre_process=True)
+        if teacher_ids.shape[:2] != student_logits.shape[:2]:
+            raise ValueError(
+                f"teacher/student sequence shapes do not match: {teacher_ids.shape[:2]} vs {student_logits.shape[:2]}"
+            )
+        kl, *_ = _VocabParallelKLDivergence.apply(student_logits, teacher_logprobs, teacher_ids, None)
+    else:
+        raise NotImplementedError(
+            f"behavior-policy top-k distillation is not supported for actor strategy {config.strategy!r}"
+        )
+    return {"behavior_distill_kl": kl}
+
+
+def behavior_policy_distillation_ppo_loss(
+    config: ActorConfig,
+    model_output=None,
+    data: TensorDict = None,
+    dp_group=None,
+    student_logits=None,
+    data_format: str = "thd",
+):
+    """Add behavior-policy response top-k forward KL to PPO using the same actor forward pass."""
+    if student_logits is not None:
+        return _compute_behavior_topk_kl(config, data, student_logits, data_format)
+
+    policy_loss, metrics = ppo_loss(config=config, model_output=model_output, data=data, dp_group=dp_group)
+    distill_kl_coef = float(tu.get_non_tensor_data(data, "distill_kl_coef", 0.0))
+    if distill_kl_coef <= 0:
+        return policy_loss, metrics
+
+    if "behavior_distill_kl" not in model_output:
+        raise RuntimeError("behavior-policy top-k KL was requested but the actor engine did not expose logits")
+    distill_kl = no_padding_2_padding(model_output["behavior_distill_kl"], data)
+    response_mask = data["response_mask"]
+    if response_mask.is_nested:
+        response_mask = response_mask.to_padded_tensor(False)
+    distill_kl_loss = agg_loss(
+        loss_mat=distill_kl,
+        loss_mask=response_mask.bool(),
+        loss_agg_mode=config.loss_agg_mode,
+        **config.global_batch_info,
+    )
+    policy_loss += distill_kl_coef * distill_kl_loss
+    metrics["actor/distill_kl_loss"] = Metric(value=distill_kl_loss, aggregation=AggregationType.SUM)
+    metrics["actor/distill_kl_coef"] = distill_kl_coef
     return policy_loss, metrics
 
 

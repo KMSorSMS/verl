@@ -63,6 +63,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
         )
+        if config.distill_topk > 0:
+            sampling_params["distill_topk"] = config.distill_topk
 
         # override sampling params for validation
         if validate:

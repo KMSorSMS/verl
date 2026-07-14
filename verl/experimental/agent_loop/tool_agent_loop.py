@@ -26,6 +26,7 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
     AgentLoopOutput,
     ToolListWrap,
+    align_response_topk_metadata,
     register,
 )
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
@@ -82,6 +83,8 @@ class AgentData:
         self.response_ids: list[int] = []
         self.response_mask: list[int] = []
         self.response_logprobs: list[float] = []
+        self.teacher_topk_ids: Optional[list[list[int]]] = None
+        self.teacher_topk_logprobs: Optional[list[list[float]]] = None
         self.turn_scores: list[float] = []
         self.tool_rewards: list[float] = []
         self.user_turns = 0
@@ -202,6 +205,9 @@ class ToolAgentLoop(AgentLoopBase):
             ),
             extra_fields=agent_data.extra_fields,
         )
+        if agent_data.teacher_topk_ids is not None:
+            output.extra_fields["teacher_topk_ids"] = agent_data.teacher_topk_ids[: self.response_length]
+            output.extra_fields["teacher_topk_logprobs"] = agent_data.teacher_topk_logprobs[: self.response_length]
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
         return output
 
@@ -248,6 +254,13 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             agent_data.metrics["num_preempted"] += output.num_preempted if output.num_preempted is not None else 0
 
+        assistant_topk_ids = output.extra_fields.pop("teacher_topk_ids", None)
+        assistant_topk_logprobs = output.extra_fields.pop("teacher_topk_logprobs", None)
+        if (assistant_topk_ids is None) != (assistant_topk_logprobs is None):
+            raise ValueError("teacher top-k ids and logprobs must be provided together")
+        if assistant_topk_ids is None and agent_data.teacher_topk_ids is not None and output.token_ids:
+            raise ValueError("vLLM omitted behavior-policy top-k metadata during a multi-turn rollout")
+
         if not agent_data.extra_fields:
             agent_data.extra_fields.update(output.extra_fields)
         else:
@@ -273,11 +286,25 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.response_mask = response_mask
             if response_logprobs is not None:
                 agent_data.response_logprobs = response_logprobs
+            if assistant_topk_ids is not None:
+                agent_data.teacher_topk_ids, agent_data.teacher_topk_logprobs = align_response_topk_metadata(
+                    merge_result,
+                    agent_data.teacher_topk_ids,
+                    agent_data.teacher_topk_logprobs,
+                    assistant_topk_ids=assistant_topk_ids,
+                    assistant_topk_logprobs=assistant_topk_logprobs,
+                )
         else:
             agent_data.prompt_ids += agent_data.response_ids
             agent_data.response_mask += [1] * len(agent_data.response_ids)
             if output.log_probs:
                 agent_data.response_logprobs += output.log_probs
+            if assistant_topk_ids is not None:
+                if agent_data.teacher_topk_ids is None:
+                    agent_data.teacher_topk_ids = []
+                    agent_data.teacher_topk_logprobs = []
+                agent_data.teacher_topk_ids += assistant_topk_ids
+                agent_data.teacher_topk_logprobs += assistant_topk_logprobs
 
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
@@ -390,6 +417,12 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data.response_mask = response_mask
             if agent_data.response_logprobs:
                 agent_data.response_logprobs = response_logprobs or []
+            if agent_data.teacher_topk_ids is not None:
+                agent_data.teacher_topk_ids, agent_data.teacher_topk_logprobs = align_response_topk_metadata(
+                    merge_result,
+                    agent_data.teacher_topk_ids,
+                    agent_data.teacher_topk_logprobs,
+                )
             agent_data.user_turns += 1
             return AgentState.GENERATING
         elif self.tool_parser_name == "gpt-oss":
@@ -440,6 +473,12 @@ class ToolAgentLoop(AgentLoopBase):
         agent_data.response_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
+        if agent_data.teacher_topk_ids is not None:
+            topk = len(agent_data.teacher_topk_ids[0])
+            agent_data.teacher_topk_ids += [[0] * topk for _ in response_ids]
+            agent_data.teacher_topk_logprobs += [
+                [torch.finfo(torch.float16).min] * topk for _ in response_ids
+            ]
         agent_data.user_turns += 1
         return AgentState.GENERATING
 

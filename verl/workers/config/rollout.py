@@ -217,6 +217,10 @@ class RolloutConfig(BaseConfig):
 
     calculate_log_probs: bool = False
 
+    # Number of behavior-policy response-token top-k logprobs returned by vLLM.
+    # Zero disables the wide on-policy distillation artifact.
+    distill_topk: int = 0
+
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
     trace: TraceConfig = field(default_factory=TraceConfig)
@@ -273,6 +277,19 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        if self.distill_topk < 0:
+            raise ValueError(f"rollout.distill_topk must be non-negative, got {self.distill_topk}")
+        if self.distill_topk > 0:
+            if self.name != "vllm":
+                raise NotImplementedError(
+                    f"rollout.distill_topk is only supported by vLLM, got rollout.name={self.name!r}"
+                )
+            vllm_engine_kwargs = dict(self.engine_kwargs.get("vllm", {}))
+            vllm_engine_kwargs["max_logprobs"] = max(
+                int(vllm_engine_kwargs.get("max_logprobs") or 0), self.distill_topk
+            )
+            self.engine_kwargs["vllm"] = vllm_engine_kwargs
+
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":
             raise ValueError(

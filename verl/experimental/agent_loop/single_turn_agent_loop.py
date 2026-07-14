@@ -16,7 +16,12 @@ import os
 from typing import Any
 from uuid import uuid4
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.experimental.agent_loop.agent_loop import (
+    AgentLoopBase,
+    AgentLoopOutput,
+    align_response_topk_metadata,
+    register,
+)
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -85,12 +90,31 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 [] if output.log_probs else None,
                 assistant_logprobs=output.log_probs if output.log_probs else None,
             )
+            teacher_topk_ids = output.extra_fields.get("teacher_topk_ids")
+            if teacher_topk_ids is not None:
+                teacher_topk_ids, teacher_topk_logprobs = align_response_topk_metadata(
+                    merge_result,
+                    None,
+                    None,
+                    assistant_topk_ids=teacher_topk_ids,
+                    assistant_topk_logprobs=output.extra_fields["teacher_topk_logprobs"],
+                )
+                output.extra_fields["teacher_topk_ids"] = teacher_topk_ids
+                output.extra_fields["teacher_topk_logprobs"] = teacher_topk_logprobs
             response_ids = merge_result.token_ids[-len(response_mask) :] if response_mask else []
             prompt_ids = merge_result.token_ids[: len(merge_result.token_ids) - len(response_mask)]
         else:
             response_ids = output.token_ids
             response_mask = [1] * len(output.token_ids)
             response_logprobs = output.log_probs
+
+        if "teacher_topk_ids" in output.extra_fields:
+            output.extra_fields["teacher_topk_ids"] = output.extra_fields["teacher_topk_ids"][
+                : self.response_length
+            ]
+            output.extra_fields["teacher_topk_logprobs"] = output.extra_fields["teacher_topk_logprobs"][
+                : self.response_length
+            ]
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,

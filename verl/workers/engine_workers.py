@@ -52,7 +52,7 @@ from verl.workers.config import (
     TrainingWorkerConfig,
 )
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
-from verl.workers.utils.losses import ppo_loss
+from verl.workers.utils.losses import behavior_policy_distillation_ppo_loss, ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -583,6 +583,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.loss_fn = partial(
                     distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
                 )
+            elif self.config.rollout.distill_topk > 0:
+                self.loss_fn = partial(behavior_policy_distillation_ppo_loss, config=actor_config)
             else:
                 self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = self.actor_worker_cls(config=actor_training_config)

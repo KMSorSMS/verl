@@ -109,6 +109,9 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Weight of the behavior-policy top-k forward-KL loss. Zero disables the consumer.
+  distill_kl_coef: 0.0
+
 # config for the trainer
 trainer:
 
