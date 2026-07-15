@@ -92,10 +92,15 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def normalize_token_ids(token_ids: Any) -> list[int]:
     """Normalize common tokenizer return shapes to one flat Python list."""
+    # BatchEncoding (a UserDict subclass, so isinstance(dict) is False) and plain dict
+    # outputs carry the ids under "input_ids"; extract before tolist so mapping objects
+    # don't fall through and get rejected as "not a flat integer list".
+    if hasattr(token_ids, "input_ids"):
+        token_ids = token_ids.input_ids
+    elif isinstance(token_ids, dict) or hasattr(token_ids, "keys"):
+        token_ids = token_ids["input_ids"]
     if hasattr(token_ids, "tolist"):
         token_ids = token_ids.tolist()
-    if isinstance(token_ids, dict):
-        token_ids = token_ids["input_ids"]
     if token_ids and isinstance(token_ids[0], list):
         if len(token_ids) != 1:
             raise ValueError(f"Expected one tokenized prompt, got batch size {len(token_ids)}")
