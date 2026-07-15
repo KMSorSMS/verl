@@ -1227,7 +1227,23 @@ class PPOTrainer(ABC):
         for record_batch in self._offline_kd_parquet.iter_batches(
             batch_size=batch_size, columns=self._offline_kd_columns
         ):
-            yield from record_batch.to_pylist()
+            topk_columns = ("teacher_topk_ids", "teacher_topk_logprobs")
+            small_columns = [name for name in self._offline_kd_columns if name not in topk_columns]
+            rows = record_batch.select(small_columns).to_pylist()
+
+            for column_name in topk_columns:
+                column = record_batch.column(record_batch.schema.get_field_index(column_name))
+                offsets = column.offsets.to_numpy(zero_copy_only=True)
+                fixed_size_lists = column.values
+                topk = fixed_size_lists.type.list_size
+                flat_values = fixed_size_lists.values.to_numpy(zero_copy_only=True)
+                value_offset = fixed_size_lists.offset
+                for row_index, row in enumerate(rows):
+                    start = (value_offset + offsets[row_index]) * topk
+                    stop = (value_offset + offsets[row_index + 1]) * topk
+                    row[column_name] = flat_values[start:stop].reshape(-1, topk)
+
+            yield from rows
 
     # PATCH(offline-kd): PUT trajectory values/tags before publishing reusable finished markers.
     def _add_offline_kd_batch(self):
@@ -1250,8 +1266,8 @@ class PPOTrainer(ABC):
                 if token_ids.min().item() < 0 or token_ids.max().item() >= len(self.tokenizer):
                     raise ValueError(f"offline KD {field_name} contain token ids outside the student vocabulary")
 
-            teacher_topk_ids = torch.tensor(row["teacher_topk_ids"], dtype=torch.int32)
-            teacher_topk_logprobs = torch.tensor(row["teacher_topk_logprobs"], dtype=torch.float16)
+            teacher_topk_ids = torch.from_numpy(row["teacher_topk_ids"])
+            teacher_topk_logprobs = torch.from_numpy(row["teacher_topk_logprobs"])
             expected_topk_shape = (responses.numel(), topk)
             if (
                 tuple(teacher_topk_ids.shape) != expected_topk_shape
