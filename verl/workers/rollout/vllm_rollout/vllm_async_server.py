@@ -599,7 +599,19 @@ class vLLMHttpServer:
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:
-            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            # PATCH(liam): at large logprobs counts (distill wide-artifact) vLLM can
+            # return a per-position logprob dict that does NOT contain the sampled
+            # token id, causing a KeyError here that aborts generation. Fall back to
+            # the smallest returned logprob for that position so generation survives.
+            log_probs = []
+            for i, logprobs in enumerate(final_res.outputs[0].logprobs):
+                entry = logprobs.get(token_ids[i])
+                if entry is not None:
+                    log_probs.append(entry.logprob)
+                elif logprobs:
+                    log_probs.append(min(lp.logprob for lp in logprobs.values()))
+                else:
+                    log_probs.append(0.0)
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
