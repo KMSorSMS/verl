@@ -236,6 +236,9 @@ calculate_log_probs: True
 # Zero disables the wide TransferQueue artifact. Supported by vLLM only.
 distill_topk: 0
 
+# PATCH(offline-kd): Fixed large-teacher corpus; null preserves online rollout behavior.
+distill_offline_corpus: null
+
 # [Experimental] agent loop based rollout configs
 agent:
 

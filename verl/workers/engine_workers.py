@@ -52,7 +52,11 @@ from verl.workers.config import (
     TrainingWorkerConfig,
 )
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
-from verl.workers.utils.losses import behavior_policy_distillation_ppo_loss, ppo_loss
+from verl.workers.utils.losses import (  # PATCH(offline-kd): select pure KD only for fixed corpora.
+    behavior_policy_distillation_ppo_loss,
+    offline_sequence_distillation_loss,
+    ppo_loss,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -579,7 +583,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 assert self.config.rollout.log_prob_micro_batch_size_per_gpu is not None
                 assert self.config.actor.ppo_micro_batch_size_per_gpu is not None
-            if self.distillation_enabled:
+            # PATCH(offline-kd): The fixed-corpus mode must never include PPO loss.
+            if self.config.rollout.distill_offline_corpus is not None:
+                self.loss_fn = partial(offline_sequence_distillation_loss, config=actor_config)
+            elif self.distillation_enabled:
                 self.loss_fn = partial(
                     distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
                 )

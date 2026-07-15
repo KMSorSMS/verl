@@ -221,6 +221,9 @@ class RolloutConfig(BaseConfig):
     # Zero disables the wide on-policy distillation artifact.
     distill_topk: int = 0
 
+    # PATCH(offline-kd): Fixed large-teacher corpus; None preserves online rollout behavior.
+    distill_offline_corpus: Optional[str] = None
+
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
     trace: TraceConfig = field(default_factory=TraceConfig)

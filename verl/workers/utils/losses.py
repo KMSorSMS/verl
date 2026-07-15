@@ -266,6 +266,43 @@ def behavior_policy_distillation_ppo_loss(
     return policy_loss, metrics
 
 
+# PATCH(offline-kd): Pure response-token KD objective for fixed large-teacher corpora.
+def offline_sequence_distillation_loss(
+    config: ActorConfig,
+    model_output=None,
+    data: TensorDict = None,
+    dp_group=None,
+    student_logits=None,
+    data_format: str = "thd",
+):
+    """Compute only response-masked, token-mean teacher top-k forward KL."""
+    if student_logits is not None:
+        return _compute_behavior_topk_kl(config, data, student_logits, data_format)
+
+    if "behavior_distill_kl" not in model_output:
+        raise RuntimeError("offline top-k KD was requested but the actor engine did not expose logits")
+
+    config.global_batch_info["dp_size"] = data["dp_size"]
+    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+
+    distill_kl = no_padding_2_padding(model_output["behavior_distill_kl"], data)
+    response_mask = data["response_mask"]
+    if response_mask.is_nested:
+        response_mask = response_mask.to_padded_tensor(False)
+    distill_kl_loss = agg_loss(
+        loss_mat=distill_kl,
+        loss_mask=response_mask.bool(),
+        loss_agg_mode="token-mean",
+        **config.global_batch_info,
+    )
+    metrics = {
+        "offline_distill_kl_loss": Metric(value=distill_kl_loss, aggregation=AggregationType.SUM),
+    }
+    return distill_kl_loss, metrics
+
+
 def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=None):
     """value loss
 

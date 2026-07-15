@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# PATCH(offline-kd): Validate fixed-corpus tokenizer compatibility and batch iteration.
+import hashlib
+import itertools
 import json
 import logging
 import math
@@ -98,6 +101,17 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+# PATCH(offline-kd): Must match gen_teacher_corpus.py's stable token-to-id fingerprint.
+def _tokenizer_vocab_sha256(tokenizer) -> str:
+    digest = hashlib.sha256()
+    for token, token_id in sorted(tokenizer.get_vocab().items()):
+        digest.update(token.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(int(token_id)).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 class PPOTrainer(ABC):
     """Base class for PPO trainer.
 
@@ -107,6 +121,10 @@ class PPOTrainer(ABC):
 
     def __init__(self, config: DictConfig):
         self.config = config
+        # PATCH(offline-kd): None leaves every existing rollout/distill branch unchanged.
+        self.distill_offline_corpus = OmegaConf.select(
+            self.config, "actor_rollout_ref.rollout.distill_offline_corpus", default=None
+        )
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
@@ -151,6 +169,9 @@ class PPOTrainer(ABC):
 
     def _setup(self):
         self._init_tokenizer()
+        # PATCH(offline-kd): Open/validate Parquet only when the explicit flag is set.
+        if self.distill_offline_corpus is not None:
+            self._init_offline_kd_corpus()
         self._init_dataloader()
         self._init_dump_executor()
         self._init_resource_pool_mgr()
@@ -421,6 +442,13 @@ class PPOTrainer(ABC):
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
+
+        # PATCH(offline-kd): Pure KD bypasses every PPO/reward/reference/critic stage.
+        if self.distill_offline_corpus is not None:
+            batch = self._balance_batch(batch, metrics=metrics)
+            with marked_timer("update_actor", timing_raw, color="red"):
+                batch = self._update_actor(batch, metrics=metrics)
+            return batch
 
         # 3. [OPTIONAL] compute reward score with colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None:
@@ -1099,6 +1127,209 @@ class PPOTrainer(ABC):
             if self.use_critic:
                 self.critic_wg.stop_profile()
 
+    # PATCH(offline-kd): Validate and lazily expose rows from the fixed teacher corpus.
+    def _init_offline_kd_corpus(self):
+        import pyarrow.parquet as pq
+
+        if not isinstance(self.distill_offline_corpus, str) or not self.distill_offline_corpus.strip():
+            raise ValueError("rollout.distill_offline_corpus must be a non-empty Parquet path")
+        if self.trainer_mode != "sync":
+            raise ValueError("offline sequence KD currently requires trainer.v1.trainer_mode=sync")
+        if int(self.config.actor_rollout_ref.rollout.n) != 1:
+            raise ValueError("offline sequence KD currently requires actor_rollout_ref.rollout.n=1")
+        if int(self.config.actor_rollout_ref.rollout.distill_topk) <= 0:
+            raise ValueError("offline sequence KD requires actor_rollout_ref.rollout.distill_topk > 0")
+        if float(self.config.actor_rollout_ref.rollout.temperature) != 1.0:
+            raise ValueError("offline sequence KD requires actor_rollout_ref.rollout.temperature=1.0")
+        if self.processor is not None:
+            raise ValueError("offline sequence KD currently supports text-only student models")
+        if self.config.actor_rollout_ref.rollout.multi_turn.enable:
+            raise ValueError("offline sequence KD currently supports single-turn text corpora only")
+        if self.use_critic:
+            raise ValueError("offline sequence KD requires the critic to be disabled")
+        if self.use_reference_policy or self.config.actor_rollout_ref.actor.use_kl_loss:
+            raise ValueError("offline sequence KD requires reference-policy KL to be disabled")
+        if self.use_teacher_policy:
+            raise ValueError("offline sequence KD cannot be combined with online teacher distillation")
+        if self.config.algorithm.get("rollout_correction") is not None:
+            raise ValueError("offline sequence KD requires rollout correction to be disabled")
+        if self.config.actor_rollout_ref.rollout.enable_rollout_routing_replay:
+            raise ValueError("offline sequence KD cannot record student rollout routing")
+        mtp_config = getattr(self.config.actor_rollout_ref.model, "mtp", None)
+        if mtp_config is not None and mtp_config.enable and mtp_config.enable_rollout:
+            raise ValueError("offline sequence KD cannot collect student rollout MTP statistics")
+        if not OmegaConf.select(self.config, "trainer.v1.sampler.sampler_kwargs.reuse_replay", default=False):
+            raise ValueError("offline sequence KD requires trainer.v1.sampler.sampler_kwargs.reuse_replay=true")
+        custom_sampler = self.config.trainer.v1.sampler.get("custom_sampler", None)
+        if custom_sampler is None or not custom_sampler.get("path") or not custom_sampler.get("name"):
+            raise ValueError("offline sequence KD requires the persistent C3 custom replay sampler")
+        if self.config.trainer.get("val_before_train", True) or (self.config.trainer.test_freq or -1) > 0:
+            raise ValueError(
+                "offline sequence KD requires trainer.val_before_train=false and trainer.test_freq<=0 "
+                "so the student never generates validation responses"
+            )
+        if self.config.trainer.get("rollout_data_dir", None):
+            raise ValueError("offline sequence KD does not support PPO rollout-data dumping")
+
+        corpus_path = os.path.expanduser(self.distill_offline_corpus)
+        self._offline_kd_parquet = pq.ParquetFile(corpus_path)
+        max_fresh_batches = int(
+            OmegaConf.select(self.config, "trainer.v1.sampler.sampler_kwargs.max_fresh_batches", default=3)
+        )
+        required_rows = max_fresh_batches * int(self.config.data.train_batch_size)
+        if max_fresh_batches <= 0 or self._offline_kd_parquet.metadata.num_rows < required_rows:
+            raise ValueError(
+                "offline KD corpus must contain every configured fresh batch: "
+                f"rows={self._offline_kd_parquet.metadata.num_rows}, required={required_rows}"
+            )
+        schema = self._offline_kd_parquet.schema_arrow
+        required_fields = {
+            "prompt_token_ids",
+            "response_token_ids",
+            "teacher_topk_ids",
+            "teacher_topk_logprobs",
+            "rollout_log_probs",
+            "response_mask",
+            "loss_mask",
+        }
+        missing_fields = required_fields.difference(schema.names)
+        if missing_fields:
+            raise ValueError(f"offline KD corpus is missing required fields: {sorted(missing_fields)}")
+        multimodal_fields = {"images", "videos", "audios", "multi_modal_inputs"}.intersection(schema.names)
+        if multimodal_fields:
+            raise ValueError(f"offline KD corpus must be text-only, found: {sorted(multimodal_fields)}")
+
+        metadata = {key.decode(): value.decode() for key, value in (schema.metadata or {}).items()}
+        if metadata.get("format") != "verl_offline_sequence_kd_v1":
+            raise ValueError(f"unsupported offline KD corpus format: {metadata.get('format')!r}")
+        corpus_topk = int(metadata.get("teacher_topk", -1))
+        configured_topk = int(self.config.actor_rollout_ref.rollout.distill_topk)
+        if corpus_topk != configured_topk:
+            raise ValueError(f"offline KD top-k mismatch: corpus={corpus_topk}, config={configured_topk}")
+        corpus_vocab_size = int(metadata.get("vocab_size", -1))
+        if corpus_vocab_size != len(self.tokenizer):
+            raise ValueError(
+                f"offline KD vocabulary-size mismatch: corpus={corpus_vocab_size}, student={len(self.tokenizer)}"
+            )
+        corpus_vocab_hash = metadata.get("tokenizer_vocab_sha256")
+        student_vocab_hash = _tokenizer_vocab_sha256(self.tokenizer)
+        if corpus_vocab_hash != student_vocab_hash:
+            raise ValueError(
+                f"offline KD token-to-id vocabulary mismatch: corpus={corpus_vocab_hash}, student={student_vocab_hash}"
+            )
+
+        self._offline_kd_columns = sorted(required_fields)
+        self._offline_kd_row_iterator = self._iter_offline_kd_rows()
+
+    # PATCH(offline-kd): Preserve corpus order across fresh batches without loading the full corpus.
+    def _iter_offline_kd_rows(self):
+        batch_size = int(self.config.data.train_batch_size)
+        for record_batch in self._offline_kd_parquet.iter_batches(
+            batch_size=batch_size, columns=self._offline_kd_columns
+        ):
+            yield from record_batch.to_pylist()
+
+    # PATCH(offline-kd): PUT trajectory values/tags before publishing reusable finished markers.
+    def _add_offline_kd_batch(self):
+        batch_size = int(self.config.data.train_batch_size)
+        rows = list(itertools.islice(self._offline_kd_row_iterator, batch_size))
+        if len(rows) != batch_size:
+            raise RuntimeError(
+                f"offline KD corpus exhausted after a partial batch: got {len(rows)}, expected {batch_size}"
+            )
+
+        topk = int(self.config.actor_rollout_ref.rollout.distill_topk)
+        trajectory_keys, trajectory_fields, trajectory_tags, prompt_keys = [], [], [], []
+        for row in rows:
+            uid = f"offlinekd{uuid.uuid4().hex}"
+            prompts = torch.tensor(row["prompt_token_ids"], dtype=torch.int64)
+            responses = torch.tensor(row["response_token_ids"], dtype=torch.int64)
+            if prompts.numel() == 0 or responses.numel() == 0:
+                raise ValueError("offline KD corpus prompts and responses must both be non-empty")
+            for field_name, token_ids in (("prompts", prompts), ("responses", responses)):
+                if token_ids.min().item() < 0 or token_ids.max().item() >= len(self.tokenizer):
+                    raise ValueError(f"offline KD {field_name} contain token ids outside the student vocabulary")
+
+            teacher_topk_ids = torch.tensor(row["teacher_topk_ids"], dtype=torch.int32)
+            teacher_topk_logprobs = torch.tensor(row["teacher_topk_logprobs"], dtype=torch.float16)
+            expected_topk_shape = (responses.numel(), topk)
+            if (
+                tuple(teacher_topk_ids.shape) != expected_topk_shape
+                or tuple(teacher_topk_logprobs.shape) != expected_topk_shape
+            ):
+                raise ValueError(
+                    "offline KD top-k tensors must match [response_len, k], got "
+                    f"ids={tuple(teacher_topk_ids.shape)}, logprobs={tuple(teacher_topk_logprobs.shape)}, "
+                    f"expected={expected_topk_shape}"
+                )
+            if teacher_topk_ids.min().item() < 0 or teacher_topk_ids.max().item() >= len(self.tokenizer):
+                raise ValueError("offline KD teacher_topk_ids contain ids outside the student vocabulary")
+            if not torch.isfinite(teacher_topk_logprobs).all():
+                raise ValueError("offline KD teacher_topk_logprobs must be finite after float16 conversion")
+            for mask_name in ("response_mask", "loss_mask"):
+                mask = row[mask_name]
+                if len(mask) != responses.numel() or any(int(value) != 1 for value in mask):
+                    raise ValueError(f"offline KD {mask_name} must contain one 1 per teacher response token")
+            rollout_log_probs = torch.tensor(row["rollout_log_probs"], dtype=torch.float32)
+            if rollout_log_probs.shape != responses.shape:
+                raise ValueError(
+                    f"offline KD rollout_log_probs must match responses: {tuple(rollout_log_probs.shape)} "
+                    f"vs {tuple(responses.shape)}"
+                )
+
+            input_ids = torch.cat((prompts, responses), dim=0)
+            attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
+            response_mask = torch.ones_like(responses, dtype=torch.int64)
+            zeros = torch.zeros_like(responses, dtype=torch.float32)
+            trajectory_keys.append(f"{uid}_0_0")
+            prompt_keys.append(uid)
+            trajectory_fields.append(
+                {
+                    "uid": uid,
+                    "session_id": 0,
+                    "global_steps": self.global_steps,
+                    "prompts": prompts,
+                    "responses": responses,
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": torch.arange(input_ids.numel(), dtype=torch.int64),
+                    "response_mask": response_mask,
+                    "loss_mask": response_mask.clone(),
+                    "teacher_topk_ids": teacher_topk_ids,
+                    "teacher_topk_logprobs": teacher_topk_logprobs,
+                    "multi_modal_inputs": {},
+                    "rollout_log_probs": rollout_log_probs,
+                    "rm_scores": zeros.clone(),
+                    "advantages": zeros.clone(),
+                    "returns": zeros.clone(),
+                    "num_turns": 1,
+                    "extra_fields": {},
+                }
+            )
+            prompt_len, response_len = prompts.numel(), responses.numel()
+            trajectory_tags.append(
+                {
+                    "status": "success",
+                    "prompt_len": prompt_len,
+                    "response_len": response_len,
+                    "seq_len": prompt_len + response_len,
+                    "global_steps": self.global_steps,
+                    "min_global_steps": self.global_steps,
+                    "max_global_steps": self.global_steps,
+                }
+            )
+
+        tq.kv_batch_put(
+            keys=trajectory_keys,
+            partition_id="train",
+            fields=tu.list_of_dict_to_tensordict(trajectory_fields),
+            tags=trajectory_tags,
+        )
+        prompt_tags = [
+            {"is_prompt": True, "status": "finished", "global_steps": self.global_steps} for _ in prompt_keys
+        ]
+        tq.kv_batch_put(keys=prompt_keys, partition_id="train", tags=prompt_tags)
+
     def _add_batch_to_generate(self):
         """Sample a batch from dataloader and add to AgentLoopManager."""
         # PATCH(liam): replay-reuse benchmark mode — stop feeding fresh prompts
@@ -1110,6 +1341,10 @@ class PPOTrainer(ABC):
             if done >= cap:
                 return
             self._liam_fresh_batches = done + 1
+        # PATCH(offline-kd): Publish teacher corpus rows and bypass student AgentLoop/vLLM generation.
+        if self.distill_offline_corpus is not None:
+            self._add_offline_kd_batch()
+            return
         try:
             if self.train_dataloader_it is None:
                 self.train_dataloader_it = iter(self.train_dataloader)
@@ -1437,12 +1672,16 @@ class PPOTrainer(ABC):
 
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
+        # PATCH(offline-kd): Pure KD selects only sequence inputs, masks, and the wide teacher artifact.
+        offline_kd = self.distill_offline_corpus is not None
         distill_kl_coef = float(self.config.algorithm.distill_kl_coef)
         if distill_kl_coef < 0:
             raise ValueError(f"algorithm.distill_kl_coef must be non-negative, got {distill_kl_coef}")
-        if distill_kl_coef > 0:
+        if offline_kd or distill_kl_coef > 0:
             distill_topk = int(self.config.actor_rollout_ref.rollout.distill_topk)
             if distill_topk <= 0:
+                if offline_kd:
+                    raise ValueError("offline sequence KD requires actor_rollout_ref.rollout.distill_topk > 0")
                 raise ValueError("algorithm.distill_kl_coef requires actor_rollout_ref.rollout.distill_topk > 0")
             if self.use_teacher_policy:
                 raise NotImplementedError("behavior-policy top-k KL cannot be combined with teacher-model distillation")
@@ -1454,7 +1693,19 @@ class PPOTrainer(ABC):
             if self.config.actor_rollout_ref.model.get("use_fused_kernels", False):
                 raise NotImplementedError("behavior-policy top-k KL requires actor logits; fused kernels hide them")
 
-            if batch.fields is None:
+            if offline_kd:
+                actor_fields = [
+                    "prompts",
+                    "responses",
+                    "input_ids",
+                    "position_ids",
+                    "response_mask",
+                    "loss_mask",
+                    "multi_modal_inputs",
+                    "teacher_topk_logprobs",
+                    "teacher_topk_ids",
+                ]
+            elif batch.fields is None:
                 actor_fields = [
                     "prompts",
                     "responses",
@@ -1486,7 +1737,10 @@ class PPOTrainer(ABC):
                         actor_fields.append(field)
 
             extra_info = dict(batch.extra_info or {})
-            extra_info["distill_kl_coef"] = distill_kl_coef
+            if offline_kd:
+                extra_info["offline_sequence_distillation"] = True
+            else:
+                extra_info["distill_kl_coef"] = distill_kl_coef
             batch = KVBatchMeta(
                 keys=batch.keys,
                 tags=batch.tags,
@@ -1497,7 +1751,7 @@ class PPOTrainer(ABC):
 
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
-        calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
+        calculate_entropy = False if offline_kd else self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
         distillation_use_topk = (
@@ -1505,7 +1759,11 @@ class PPOTrainer(ABC):
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
-        distillation_use_topk = distillation_use_topk or batch.extra_info.get("distill_kl_coef", 0.0) > 0
+        distillation_use_topk = (
+            distillation_use_topk
+            or batch.extra_info.get("distill_kl_coef", 0.0) > 0
+            or batch.extra_info.get("offline_sequence_distillation", False)
+        )
         extra_info = {
             "calculate_entropy": calculate_entropy,
             "distillation_use_topk": distillation_use_topk,
