@@ -1222,7 +1222,15 @@ class PPOTrainer(ABC):
         # Upsampling the batch with padding sequences
         batch_multiple = self._get_required_batch_multiple(dp_size)
         batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
-        global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
+        # PATCH(liam): the mooncake backend can drop the "seq_len" tag on retrieval
+        # (replayed keys come back without it); fall back to prompt_len+response_len,
+        # which are set alongside it, so seqlen-balancing stays robust.
+        def _tag_seq_len(tag):
+            sl = tag.get("seq_len")
+            if sl is None:
+                sl = int(tag.get("prompt_len", 0)) + int(tag.get("response_len", 0))
+            return sl
+        global_seqlen_lst = torch.tensor([_tag_seq_len(tag) for tag in batch.tags], dtype=torch.int64)
         workload_lst = calculate_workload(global_seqlen_lst)
 
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
