@@ -346,8 +346,21 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
                 logger.info(
                     f"Task {func.__name__} (pid={pid}) is getting len_samples={batch_meta.size}, cost time: {t2 - t1}"
                 )
+                # TEMP PROBE (revert after transport A/B): stdout so Ray forwards it to the driver log.
+                _fetch_gb = sum(
+                    v.numel() * v.element_size() for a in args if isinstance(a, TensorDict) for v in a.values(True, True) if isinstance(v, torch.Tensor)
+                ) / 1e9
+                print(f"[TQPROBE] {func.__name__} pid={pid} fetch_s={t2 - t1:.3f} fetch_gb={_fetch_gb:.3f}", flush=True)
 
                 output = func(*args, **kwargs)
+                t3 = time.time()
+                print(f"[TQPROBE] {func.__name__} pid={pid} compute_s={t3 - t2:.3f}", flush=True)
+                # Zero-copy contract: compute is done (H2D copies included), CPU views are
+                # dead weight now — return the slabs to the pool. No-op on the copy path.
+                for _a in args:
+                    _rel = getattr(_a, "_tq_release", None)
+                    if callable(_rel):
+                        _rel()
 
                 put_data = False
                 if isinstance(output, TensorDict):

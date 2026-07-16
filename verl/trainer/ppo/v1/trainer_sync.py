@@ -35,11 +35,18 @@ class PPOTrainerSync(PPOTrainer):
         self.checkpoint_manager.update_weights(self.global_steps)
 
     def on_step_end(self):
+        # Offline-KD (distill_offline_corpus): the corpus replaces generation entirely,
+        # so syncing actor weights to the idle rollout engine every step is pure dead
+        # time (~2.4-3.5s/step measured). Skip the sync (and the matching sleep below).
+        if self.config.actor_rollout_ref.rollout.get("distill_offline_corpus", None):
+            return
         with marked_timer("update_weights", self.timing_raw, color="red"):
             # wake up all replicas to update weights
             self.checkpoint_manager.update_weights(self.global_steps)
 
     def on_sample_end(self):
+        if self.config.actor_rollout_ref.rollout.get("distill_offline_corpus", None):
+            return
         # sleep all replicas to discard weights and kv cache
         self.checkpoint_manager.sleep_replicas()
 
